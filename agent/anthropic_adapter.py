@@ -1074,14 +1074,49 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
             if fresh_creds.get("refreshToken"):
                 refresh_token = fresh_creds["refreshToken"]
 
+        # CAS snapshot: stat the credentials file BEFORE the HTTP refresh so
+        # we can detect peers that wrote during our HTTP window without
+        # honouring our flock (Cursor IDE Claude Code is the canonical case).
+        # mtime_ns is nanosecond-resolution on Linux, so false negatives
+        # require two writes within one fs tick — effectively impossible.
+        cred_path = Path.home() / ".claude" / ".credentials.json"
+        try:
+            cas_mtime_ns = cred_path.stat().st_mtime_ns
+        except OSError:
+            cas_mtime_ns = None  # file may not exist yet; first refresh ever
+
         try:
             refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+
+            # CAS check: did anyone touch the file while we were waiting on
+            # anthropic? If yes, prefer the peer's write when it's still valid.
+            try:
+                cur_mtime_ns = cred_path.stat().st_mtime_ns
+            except OSError:
+                cur_mtime_ns = None
+            if cas_mtime_ns is not None and cur_mtime_ns is not None and cur_mtime_ns != cas_mtime_ns:
+                try:
+                    peer_creds = read_claude_code_credentials()
+                except Exception:
+                    peer_creds = None
+                if peer_creds:
+                    peer_expires = peer_creds.get("expiresAt", 0)
+                    if peer_expires:
+                        peer_remaining_ms = int(peer_expires) - int(time.time() * 1000)
+                        if peer_remaining_ms > _OAUTH_REFRESH_GRACE_MS:
+                            logger.info(
+                                "OAuth refresh CAS: peer wrote newer creds during our HTTP "
+                                "window (%.1f min left); discarding our own refresh",
+                                peer_remaining_ms / 60_000,
+                            )
+                            return peer_creds.get("accessToken") or refreshed["access_token"]
+
             _write_claude_code_credentials(
                 refreshed["access_token"],
                 refreshed["refresh_token"],
                 refreshed["expires_at_ms"],
             )
-            logger.debug("Successfully refreshed Claude Code OAuth token (lock held)")
+            logger.debug("Successfully refreshed Claude Code OAuth token (lock + CAS held)")
             return refreshed["access_token"]
         except Exception as e:
             logger.debug("Failed to refresh Claude Code token: %s", e)
