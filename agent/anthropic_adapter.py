@@ -985,25 +985,109 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
     raise ValueError("Anthropic token refresh failed")
 
 
+_OAUTH_LOCK_PATH = Path.home() / ".claude" / ".credentials.json.lock"
+_OAUTH_REFRESH_GRACE_MS = 5 * 60 * 1000  # 5 minutes — skip refresh if existing token is fresher than this
+
+
+def _acquire_oauth_lock():
+    """Open + LOCK_EX the OAuth credential lock file. Returns the open
+    file handle; caller must keep it open for the lock to remain held.
+
+    Uses fcntl.flock so the lock is per-machine and OS-managed (released
+    automatically if the holding process dies, unlike PID-based locks).
+    Falls back to a no-op context manager on platforms without fcntl
+    (Windows) so hermes still works there with race risk.
+    """
+    try:
+        import fcntl  # POSIX only
+    except ImportError:
+        # No fcntl on Windows — return a dummy file-like with no-op close.
+        # Race risk persists but functionality is preserved.
+        class _NoLock:
+            def close(self):
+                pass
+        return _NoLock()
+
+    _OAUTH_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Use 'a' so a stale lock file is reused without truncation but the
+    # file is still created if missing.
+    lock_fh = open(_OAUTH_LOCK_PATH, "a")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+    except OSError as e:
+        logger.debug("OAuth lock acquire failed (%s); proceeding without lock", e)
+    return lock_fh
+
+
+def _release_oauth_lock(lock_fh) -> None:
+    """Release the OAuth lock + close the handle. Best-effort."""
+    try:
+        import fcntl  # POSIX only
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    except (ImportError, OSError, AttributeError):
+        pass
+    try:
+        lock_fh.close()
+    except OSError:
+        pass
+
+
 def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
-    """Attempt to refresh an expired Claude Code OAuth token."""
+    """Attempt to refresh an expired Claude Code OAuth token.
+
+    Serialized across processes via fcntl.flock on
+    ``~/.claude/.credentials.json.lock`` so concurrent Cursor / hermes /
+    manual scripts cannot race-rotate the refresh_token (Incident 6).
+    After acquiring the lock we re-read the file: if another process just
+    refreshed and the persisted token is now valid for >5 minutes, we
+    use that one and skip our own refresh — saves a refresh_token
+    rotation and the HTTP roundtrip.
+    """
+    import time
+
     refresh_token = creds.get("refreshToken", "")
     if not refresh_token:
         logger.debug("No refresh token available — cannot refresh")
         return None
 
+    lock_fh = _acquire_oauth_lock()
     try:
-        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-        _write_claude_code_credentials(
-            refreshed["access_token"],
-            refreshed["refresh_token"],
-            refreshed["expires_at_ms"],
-        )
-        logger.debug("Successfully refreshed Claude Code OAuth token")
-        return refreshed["access_token"]
-    except Exception as e:
-        logger.debug("Failed to refresh Claude Code token: %s", e)
-        return None
+        # Double-check: another process may have refreshed while we were
+        # waiting on the lock. Re-read the credential file and return the
+        # persisted token if it's still valid for >5min.
+        try:
+            fresh_creds = read_claude_code_credentials()
+        except Exception:
+            fresh_creds = None
+        if fresh_creds:
+            expires_at = fresh_creds.get("expiresAt", 0)
+            if expires_at:
+                remaining_ms = int(expires_at) - int(time.time() * 1000)
+                if remaining_ms > _OAUTH_REFRESH_GRACE_MS:
+                    logger.debug(
+                        "OAuth lock: another process already refreshed (%.1f min left); skipping our refresh",
+                        remaining_ms / 60_000,
+                    )
+                    return fresh_creds.get("accessToken") or None
+            # Use the freshest refresh_token we know about (in case we
+            # were called with a stale one).
+            if fresh_creds.get("refreshToken"):
+                refresh_token = fresh_creds["refreshToken"]
+
+        try:
+            refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+            _write_claude_code_credentials(
+                refreshed["access_token"],
+                refreshed["refresh_token"],
+                refreshed["expires_at_ms"],
+            )
+            logger.debug("Successfully refreshed Claude Code OAuth token (lock held)")
+            return refreshed["access_token"]
+        except Exception as e:
+            logger.debug("Failed to refresh Claude Code token: %s", e)
+            return None
+    finally:
+        _release_oauth_lock(lock_fh)
 
 
 def _write_claude_code_credentials(
