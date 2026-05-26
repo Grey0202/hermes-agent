@@ -28,6 +28,8 @@ from __future__ import annotations
 import logging
 import re
 import inspect
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as _FutureTimeout
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -265,18 +267,8 @@ class MemoryManager:
         is_builtin = provider.name == "builtin"
 
         if not is_builtin:
-            if self._has_external:
-                existing = next(
-                    (p.name for p in self._providers if p.name != "builtin"), "unknown"
-                )
-                logger.warning(
-                    "Rejected memory provider '%s' — external provider '%s' is "
-                    "already registered. Only one external memory provider is "
-                    "allowed at a time. Configure which one via memory.provider "
-                    "in config.yaml.",
-                    provider.name, existing,
-                )
-                return
+            # PATCH-002: multi-provider mode — multiple external providers coexist.
+            # Tool name collisions resolved by first-registration-wins.
             self._has_external = True
 
         self._providers.append(provider)

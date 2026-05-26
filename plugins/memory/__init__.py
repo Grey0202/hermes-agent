@@ -252,12 +252,24 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                     try:
                         sub_spec.loader.exec_module(sub_mod)
                     except Exception as e:
-                        logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
+                        # Patch 018 (ultra-review 2026-05-12): WARNING not DEBUG.
+                        # Submodule load failures cascade into "no provider
+                        # instance found" warnings later, which hide the
+                        # actual ImportError / AttributeError root cause.
+                        logger.warning(
+                            "plugins.memory: failed to load submodule %s: %s: %s",
+                            full_sub_name, type(e).__name__, e,
+                        )
 
         try:
             spec.loader.exec_module(mod)
         except Exception as e:
-            logger.debug("Failed to exec_module %s: %s", module_name, e)
+            # Patch 018: WARNING + exception type so operators can see why
+            # a provider was rejected without enabling DEBUG logging.
+            logger.warning(
+                "plugins.memory: failed to exec_module %s: %s: %s",
+                module_name, type(e).__name__, e,
+            )
             sys.modules.pop(module_name, None)
             return None
 
@@ -269,7 +281,12 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
             if collector.provider:
                 return collector.provider
         except Exception as e:
-            logger.debug("register() failed for %s: %s", name, e)
+            # Patch 018: register() failures (e.g. cannot import from a
+            # half-loaded sibling module) used to be invisible at INFO.
+            logger.warning(
+                "plugins.memory: register() failed for %s: %s: %s",
+                name, type(e).__name__, e,
+            )
 
     # Fallback: find a MemoryProvider subclass and instantiate it
     from agent.memory_provider import MemoryProvider

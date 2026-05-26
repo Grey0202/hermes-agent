@@ -52,6 +52,26 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.4.22"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+# Patch 020 (rewrite 2026-05-26): async-only refresh worker. See
+# HEALTH-2026-05-26.md. Hindsight recall takes 11.6-11.8 s per query on the
+# embedded daemon (cross-encoder reranker, 300 candidates). prefetch_all has
+# a 6 s ceiling. There is no sync-recall timeout that works: too short and
+# every fallback returns ""; too long and workers orphan past prefetch_all's
+# window, and N concurrent chat sessions x M turns of bursty traffic can
+# stack arbitrary recall load on the daemon. Patch 020 redesigns hindsight
+# as fully async: prefetch() is a read-only cache lookup, queue_prefetch()
+# enqueues onto a single persistent refresh-worker thread per provider
+# instance, and a module-level semaphore caps concurrent daemon recalls
+# across all instances.
+_REFRESH_QUEUE_MAX = 5
+_REFRESH_SENTINEL = object()
+# Cross-session DDoS cap: at most N hindsight recalls in flight against the
+# daemon at any given time, regardless of how many chat sessions are alive.
+# Each provider instance funnels through this semaphore inside its own
+# refresh worker. 2 is a starting point — enough to avoid serializing
+# unrelated sessions completely, low enough that a burst of 10+ sessions
+# doesn't pile 10 recalls onto the daemon at once.
+_DAEMON_SEMAPHORE = threading.Semaphore(2)
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -547,7 +567,17 @@ class HindsightMemoryProvider(MemoryProvider):
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
+        # Patch 020: kept for backward-compat with on_session_switch /
+        # shutdown legacy joins, but queue_prefetch no longer spawns this
+        # thread. It will always be None under the new async-only flow.
         self._prefetch_thread = None
+        # Patch 020: single persistent refresh worker per provider instance.
+        # queue_prefetch enqueues onto _refresh_queue (bounded, drops on
+        # overflow). The worker drains the queue with coalescing — newer
+        # items supersede older ones — and writes results to _prefetch_result
+        # for the NEXT prefetch() call to pick up.
+        self._refresh_queue: queue.Queue = queue.Queue(maxsize=_REFRESH_QUEUE_MAX)
+        self._refresh_thread: threading.Thread | None = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1279,67 +1309,197 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            logger.debug("Prefetch: waiting for background thread to complete")
-            self._prefetch_thread.join(timeout=3.0)
+        """Return cached recall context. NEVER fires a recall. NEVER blocks
+        on the daemon.
+
+        Patch 020 (rewrite 2026-05-26): hindsight's daemon-side recall takes
+        11.6-11.8 s per query, but prefetch_all has a 6 s ceiling. Earlier
+        patches (004 / 016 / 019) tried to make a sync-fallback path work
+        within that budget; all failed (4 s -> 100 % empty; 15 s -> worker
+        orphaning + cross-session DDoS risk). Patch 020 abandons the sync
+        path entirely: prefetch() is now a read-only cache lookup,
+        queue_prefetch() enqueues onto a persistent refresh worker, and
+        first-turn-after-restart accepts an empty result as a known trade-off.
+
+        Cache is NOT drained on read. It stays until the refresh worker
+        overwrites it. Intentional: if turn N+1 fires before refresh completes
+        the agent gets the same cached recall as turn N. Stale is better
+        than empty.
+        """
         with self._prefetch_lock:
             result = self._prefetch_result
-            self._prefetch_result = ""
         if not result:
-            logger.debug("Prefetch: no results available")
+            logger.debug("Prefetch: cache empty (refresh worker pending or daemon cold)")
             return ""
-        logger.debug("Prefetch: returning %d chars of context", len(result))
+        logger.debug("Prefetch: returning %d chars of context (cached)", len(result))
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
             "Use this to answer questions about the user and prior sessions. "
-            "Do not call tools to look up information that is already present here."
+            "Each bullet is a recall result with relevance >= the bank's threshold."
         )
         return f"{header}\n\n{result}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Enqueue a refresh job onto the persistent worker. Non-blocking.
+
+        Patch 020: never spawns a thread per call. Bounded queue (size 5);
+        on overflow, the oldest pending job is dropped and the new one
+        enqueued. The worker also coalesces — when it picks up an item it
+        drains any newer items and uses only the most recent query, so a
+        burst of N rapid turns produces 1 recall, not N.
+        """
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
             return
         if not self._auto_recall:
             logger.debug("Prefetch: skipped (auto_recall disabled)")
             return
-        if self._shutting_down.is_set():
-            logger.debug("Prefetch: skipped (shutting down)")
+        if not query:
             return
-        # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
-
-        def _run():
+        # Patch 020 fix: _ensure_refresh_worker clears _shutting_down so a
+        # per-turn provider.shutdown (gateway slot release) doesn't pin the
+        # provider into a dead state. Must run BEFORE any _shutting_down
+        # check — the legacy queue_prefetch_all gate was the silent reason
+        # the cache never warmed in 14:30-14:48 turn 1-3 trace.
+        self._ensure_refresh_worker()
+        item = (query, session_id)
+        try:
+            self._refresh_queue.put_nowait(item)
+        except queue.Full:
+            # Queue full: drop the oldest pending item and try again. The
+            # worker's coalescing means we'd only use the newest anyway.
             try:
-                if self._prefetch_method == "reflect":
-                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                    text = resp.text or ""
-                else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
-                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                                 self._bank_id, len(query), self._budget)
-                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                    num_results = len(resp.results) if resp.results else 0
-                    logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                self._refresh_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._refresh_queue.put_nowait(item)
+            except queue.Full:
+                logger.debug("Hindsight refresh queue full after drain; dropping")
+
+    def _ensure_refresh_worker(self) -> None:
+        """Lazy-start the single persistent refresh worker thread.
+
+        Patch 020 fix (post-deploy 2026-05-12 14:46): hermes' gateway calls
+        provider.shutdown() between turns (gateway/run.py: _cleanup_agent
+        _resources before releasing the running-agent slot). That sets
+        _shutting_down and kills the worker. Without restart semantics, the
+        cache is never warmed because queue_prefetch is also gated on the
+        same flag. Mirrors the _ensure_writer (retain) pattern: clear the
+        flag and start a fresh worker. Drain any leftover sentinel that a
+        previous shutdown injected before its 10s join timed out, so the
+        new worker doesn't immediately re-exit.
+        """
+        thread = self._refresh_thread
+        if thread is not None and thread.is_alive():
+            # Codex Phase 2 review fix 2026-05-26: clear _shutting_down even
+            # when the old worker is still alive. Without this, a previous
+            # shutdown() that timed out (worker hung past 10s join) leaves
+            # _shutting_down set. The old worker will exit on its next loop
+            # iteration; new queue_prefetch calls will be silently abandoned
+            # because the worker's `while not self._shutting_down.is_set()`
+            # exits before picking up the queued item.
+            self._shutting_down.clear()
+            return
+        # Drop any leftover sentinels from a prior shutdown that didn't
+        # actually stop the worker before its join timeout. Without this,
+        # the new worker would pop _REFRESH_SENTINEL and exit immediately.
+        cleaned: list = []
+        while True:
+            try:
+                item = self._refresh_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not _REFRESH_SENTINEL:
+                cleaned.append(item)
+        for item in cleaned:
+            try:
+                self._refresh_queue.put_nowait(item)
+            except queue.Full:
+                break
+        self._shutting_down.clear()
+        thread = threading.Thread(
+            target=self._refresh_worker_loop,
+            daemon=True,
+            name="hindsight-refresh",
+        )
+        self._refresh_thread = thread
+        thread.start()
+
+    def _refresh_worker_loop(self) -> None:
+        """Drain the refresh queue. Coalesce. Gate on the daemon semaphore.
+
+        Patch 020: this is the ONLY place arecall fires under auto-recall.
+        Each iteration grabs the newest queued (query, session_id), runs
+        the recall against the daemon (gated by _DAEMON_SEMAPHORE to cap
+        cross-session pressure), and writes the result to _prefetch_result
+        for the next prefetch() call to pick up. Cache is overwritten on
+        success only — a failed recall leaves the previous cache in place
+        so the agent still gets SOMETHING.
+        """
+        while not self._shutting_down.is_set():
+            try:
+                item = self._refresh_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if item is _REFRESH_SENTINEL:
+                return
+            # Coalesce: drain any newer items, use the most recent only.
+            latest = item
+            while True:
+                try:
+                    nxt = self._refresh_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is _REFRESH_SENTINEL:
+                    return
+                latest = nxt
+            query, _session_id = latest
+            if self._shutting_down.is_set():
+                return
+            try:
+                with _DAEMON_SEMAPHORE:
+                    if self._shutting_down.is_set():
+                        return
+                    if self._prefetch_method == "reflect":
+                        logger.debug("Refresh: reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+                        resp = self._run_hindsight_operation(
+                            lambda client: client.areflect(
+                                bank_id=self._bank_id, query=query, budget=self._budget,
+                            )
+                        )
+                        text = resp.text or ""
+                    else:
+                        recall_kwargs: dict = {
+                            "bank_id": self._bank_id, "query": query,
+                            "budget": self._budget, "max_tokens": self._recall_max_tokens,
+                        }
+                        if self._recall_tags:
+                            recall_kwargs["tags"] = self._recall_tags
+                            recall_kwargs["tags_match"] = self._recall_tags_match
+                        if self._recall_types:
+                            recall_kwargs["types"] = self._recall_types
+                        logger.debug("Refresh: recall (bank=%s, query_len=%d, budget=%s)",
+                                     self._bank_id, len(query), self._budget)
+                        resp = self._run_hindsight_operation(
+                            lambda client: client.arecall(**recall_kwargs)
+                        )
+                        num_results = len(resp.results) if resp.results else 0
+                        logger.debug("Refresh: recall returned %d results", num_results)
+                        text = (
+                            "\n".join(f"- {r.text}" for r in resp.results if r.text)
+                            if resp.results else ""
+                        )
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
+                    logger.debug("Refresh: cached %d chars for next prefetch", len(text))
+                else:
+                    logger.debug("Refresh: empty result; keeping previous cache (if any)")
             except Exception as e:
-                logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
-
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
-        self._prefetch_thread.start()
+                logger.debug("Hindsight refresh failed: %s", e, exc_info=True)
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
         now = datetime.now(timezone.utc).isoformat()
@@ -1445,11 +1605,10 @@ class HindsightMemoryProvider(MemoryProvider):
                      len(self._session_turns), sum(len(t) for t in self._session_turns))
         content = "[" + ",".join(self._session_turns) + "]"
 
+        # PATCH-022: session/parent tags removed for cross-session consolidation.
+        # See /root/.hermes/patches/022-hindsight-no-session-tag/README.md
+        # session_id remains in metadata field (audit trail preserved, not tag-filtered).
         lineage_tags: list[str] = []
-        if self._session_id:
-            lineage_tags.append(f"session:{self._session_id}")
-        if self._parent_session_id:
-            lineage_tags.append(f"parent:{self._parent_session_id}")
 
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
@@ -1618,11 +1777,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 message_count=len(old_turns) * 2,
                 turn_index=old_turn_index,
             )
+            # PATCH-022: see above. Old session flush also omits session tags.
             old_lineage_tags: list[str] = []
-            if old_session_id:
-                old_lineage_tags.append(f"session:{old_session_id}")
-            if old_parent_session_id:
-                old_lineage_tags.append(f"parent:{old_parent_session_id}")
             old_content = "[" + ",".join(old_turns) + "]"
             # Resolve doc_id + update_mode against the OLD session BEFORE
             # we rotate _session_id, so the flush lands in the old
@@ -1670,10 +1826,19 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._register_atexit()
                 self._retain_queue.put(_flush)
 
-        # 2. Drain any in-flight prefetch from the old session and drop
-        # its cached result so the new session doesn't see stale recall.
+        # 2. Patch 020: drop the cache so the new session doesn't see stale
+        # recall, and drain any queued refresh jobs from the old session.
+        # The persistent refresh worker keeps running — it'll pick up the
+        # new session's queue_prefetch calls. The legacy _prefetch_thread
+        # check is kept as a safety net in case anything external still
+        # spawns into it.
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
+        while True:
+            try:
+                self._refresh_queue.get_nowait()
+            except queue.Empty:
+                break
         with self._prefetch_lock:
             self._prefetch_result = ""
 
@@ -1714,6 +1879,26 @@ class HindsightMemoryProvider(MemoryProvider):
                 )
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=5.0)
+        # Patch 020: drain the refresh worker. Inject the sentinel so the
+        # worker exits its 1-second queue.get poll immediately even when
+        # the queue is otherwise empty.
+        refresh = self._refresh_thread
+        if refresh is not None and refresh.is_alive():
+            try:
+                self._refresh_queue.put_nowait(_REFRESH_SENTINEL)
+            except queue.Full:
+                # Drain one slot to make room for the sentinel.
+                try:
+                    self._refresh_queue.get_nowait()
+                    self._refresh_queue.put_nowait(_REFRESH_SENTINEL)
+                except (queue.Empty, queue.Full):
+                    pass
+            refresh.join(timeout=10.0)
+            if refresh.is_alive():
+                logger.warning(
+                    "Hindsight refresh worker did not stop within 10s; "
+                    "abandoning thread"
+                )
         if self._client is not None:
             try:
                 if self._mode == "local_embedded":
