@@ -8795,6 +8795,19 @@ class GatewayRunner:
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
                 self.session_store._save()
+                # Send compression notification if configured
+                _comp_cfg = _load_gateway_config().get("compression", {})
+                if _comp_cfg.get("notify", False):
+                    try:
+                        _notif_adapter = self.adapters.get(source.platform)
+                        if _notif_adapter:
+                            _notif_msg = _comp_cfg.get(
+                                "notify_message",
+                                "⚡ 上下文已自动压缩，对话历史已精简摘要，当前对话继续有效。",
+                            )
+                            await _notif_adapter.send(source.chat_id, _notif_msg)
+                    except Exception as _notif_err:
+                        logger.debug("Compression notification failed: %s", _notif_err)
 
             # Prepend reasoning/thinking if display is enabled (per-platform)
             try:

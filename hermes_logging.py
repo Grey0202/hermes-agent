@@ -138,6 +138,30 @@ class _ComponentFilter(logging.Filter):
         return record.name.startswith(self._prefixes)
 
 
+class _DropAiohttpUnclosedFilter(logging.Filter):
+    """Drop ``asyncio: Unclosed client session`` records.
+
+    These are GC-time warnings from aiohttp when a ``ClientSession`` was
+    created without ``async with`` / ``close()``. They are benign (the
+    session is already gone) and, in Hermes, account for ~90% of
+    ``errors.log`` volume, drowning real signal. Attached only to the
+    ``errors.log`` handler so the records still appear in ``agent.log``
+    if someone really wants to hunt the source.
+
+    Opt out by setting ``HERMES_KEEP_AIOHTTP_UNCLOSED=1`` in the env.
+    """
+
+    _PATTERNS = ("Unclosed client session", "Unclosed connector")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if os.getenv("HERMES_KEEP_AIOHTTP_UNCLOSED") == "1":
+            return True
+        if record.name != "asyncio":
+            return True
+        msg = record.getMessage()
+        return not any(p in msg for p in self._PATTERNS)
+
+
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
@@ -223,6 +247,9 @@ def setup_logging(
     )
 
     # --- errors.log (WARNING+) — quick triage log --------------------------
+    # Filter out aiohttp unclosed-session noise unless explicitly opted in
+    # via HERMES_KEEP_AIOHTTP_UNCLOSED=1. These GC-time records were
+    # ~90% of errors.log volume and are post-hoc warnings, not actionable.
     _add_rotating_handler(
         root,
         log_dir / "errors.log",
@@ -230,6 +257,7 @@ def setup_logging(
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
         formatter=RedactingFormatter(_LOG_FORMAT),
+        log_filter=_DropAiohttpUnclosedFilter(),
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------
