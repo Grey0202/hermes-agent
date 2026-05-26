@@ -54,6 +54,179 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+# >>> patch-010-debug-build-system-prompt >>>
+# Patch 010 — POST /internal/build_system_prompt
+# Spec: hermes-eval/scripts/patch_010/010-debug-build-system-prompt.py
+import hmac as _p010_hmac
+import threading as _p010_threading
+import time as _p010_time
+from collections import defaultdict as _p010_defaultdict, deque as _p010_deque
+from concurrent.futures import ThreadPoolExecutor as _P010Pool
+
+_P010_ENV_ENABLED = "HERMES_DEBUG_API_ENABLED"
+_P010_ENV_TOKEN = "HERMES_DEBUG_TOKEN"
+_P010_RATE_LIMIT_REQUESTS = 100  # tuned 2026-04-29: 60-query daily would 429 at 10/min
+_P010_RATE_LIMIT_WINDOW = 60.0
+_P010_BUILD_TIMEOUT = 30.0  # tuned 2026-04-29: queue+sleep+prefetch_all+HS recall can take 15-25s
+_P010_SUPPORTED_MODES = ("weixin_event",)
+
+# max_workers tuned 2026-05-11 (ultra-review fix): 100 req/60s rate limit
+# permits ~1.66 req/s sustained. Each request takes ~8s (2s sleep +
+# 6s prefetch_all + HS recall), so 2 workers ceiling at 0.25 req/s would
+# starve concurrent eval callers — 3rd caller queues for 8s and then has
+# only 22s left of the 30s wait_for budget before 504. Sized at 8 to
+# match the daily-eval 8-way parallel run pattern.
+_p010_pool = _P010Pool(max_workers=8, thread_name_prefix="patch010-build")
+_p010_buckets: "dict[str, _p010_deque[float]]" = _p010_defaultdict(_p010_deque)
+_p010_lock = _p010_threading.Lock()
+
+
+def _p010_enabled() -> bool:
+    return os.environ.get(_P010_ENV_ENABLED, "").lower() in ("1", "true", "yes")
+
+
+def _p010_const_eq(a: str, b: str) -> bool:
+    # hmac.compare_digest is constant-time across mismatched lengths
+    # (manual prefix-length check leaked the comparand's length via timing).
+    return _p010_hmac.compare_digest(a.encode(), b.encode())
+
+
+def _p010_allow(token: str) -> bool:
+    now = _p010_time.monotonic()
+    cutoff = now - _P010_RATE_LIMIT_WINDOW
+    with _p010_lock:
+        bucket = _p010_buckets[token]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= _P010_RATE_LIMIT_REQUESTS:
+            return False
+        bucket.append(now)
+        return True
+
+
+def _p010_redactor():
+    try:
+        from agent.redact import redact_secrets as _r  # type: ignore
+        return _r
+    except ImportError:
+        try:
+            from agent.redact import redact_sensitive_text as _r  # type: ignore
+            return _r
+        except ImportError:
+            return lambda s: s
+
+
+def _p010_redact_payload(payload):
+    redactor = _p010_redactor()
+    flag = [False]
+
+    def walk(node):
+        if isinstance(node, str):
+            new = redactor(node)
+            if new != node:
+                flag[0] = True
+            return new
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        if isinstance(node, tuple):
+            return tuple(walk(x) for x in node)
+        return node
+
+    return walk(payload), flag[0]
+
+
+def _p010_build_sync(mode, event_payload):
+    from agent.debug_build import build_system_prompt_for_payload  # type: ignore
+    return build_system_prompt_for_payload(
+        mode=mode,
+        event_payload=event_payload,
+    )
+
+
+async def _p010_handle(request):  # aiohttp handler
+    if not _p010_enabled():
+        return web.json_response({"detail": "patch 010 disabled"}, status=404)
+
+    expected = os.environ.get(_P010_ENV_TOKEN, "").strip()
+    if not expected:
+        return web.json_response(
+            {"detail": "HERMES_DEBUG_TOKEN not configured on server"},
+            status=503,
+        )
+
+    auth = request.headers.get("Authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return web.json_response({"detail": "Bearer token required"}, status=401)
+    presented = auth[7:].strip()
+    if not _p010_const_eq(presented, expected):
+        return web.json_response({"detail": "invalid bearer token"}, status=401)
+    if not _p010_allow(presented):
+        return web.json_response(
+            {"detail": f"rate limit: {_P010_RATE_LIMIT_REQUESTS} req/{int(_P010_RATE_LIMIT_WINDOW)}s per token"},
+            status=429,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"detail": "body must be JSON"}, status=422)
+    if not isinstance(body, dict):
+        return web.json_response({"detail": "body must be a JSON object"}, status=422)
+    # session_id silently accepted (back-compat) but IGNORED — providers
+    # bind to the singleton sid at init, so per-call sid had no effect
+    # anyway. See agent/debug_build.py module docstring.
+    extra = set(body) - {"mode", "event_payload", "session_id"}
+    if extra:
+        return web.json_response(
+            {"detail": f"unexpected fields: {sorted(extra)}"}, status=422,
+        )
+    mode = body.get("mode")
+    event_payload = body.get("event_payload")
+    if mode not in _P010_SUPPORTED_MODES:
+        return web.json_response({"detail": f"unsupported mode: {mode!r}"}, status=422)
+    if not isinstance(event_payload, dict):
+        return web.json_response({"detail": "event_payload must be an object"}, status=422)
+
+    started = _p010_time.perf_counter()
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(_p010_pool, _p010_build_sync, mode, event_payload)
+    try:
+        raw = await asyncio.wait_for(fut, timeout=_P010_BUILD_TIMEOUT)
+    except asyncio.TimeoutError:
+        return web.json_response(
+            {"detail": f"prompt build exceeded {_P010_BUILD_TIMEOUT:.1f}s"},
+            status=504,
+        )
+    except Exception as exc:
+        logger.exception("[patch010] build failed: %s", exc)
+        return web.json_response({"detail": f"build failed: {exc}"}, status=500)
+    elapsed_ms = (_p010_time.perf_counter() - started) * 1000.0
+
+    # Schema v3 (2026-04-29): memory_blocks keyed by layer; user_memory_context
+    # carries the fenced <memory-context> block hermes injects into the user
+    # message; raw_prefetch is the unfenced prefetch_all output (for debug).
+    payload = {
+        "system_prompt": str(raw.get("system_prompt", "")),
+        "memory_blocks": dict(raw.get("memory_blocks", {})),
+        "raw_daemon": dict(raw.get("raw_daemon", {})),
+        "token_count": int(raw.get("token_count", 0)),
+        "truncated_layers": list(raw.get("truncated_layers", [])),
+        "user_memory_context": str(raw.get("user_memory_context", "")),
+        "raw_prefetch": str(raw.get("raw_prefetch", "")),
+    }
+    redacted, changed = _p010_redact_payload(payload)
+    redacted["elapsed_ms"] = round(elapsed_ms, 3)
+    redacted["redaction_applied"] = changed
+    return web.json_response(redacted, status=200)
+# <<< patch-010-debug-build-system-prompt <<<
+
+
+
+
+
+
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
@@ -3511,6 +3684,23 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+
+            # >>> patch-010-debug-build-system-prompt >>>
+            if _p010_enabled():
+                # 127.0.0.1 only — refuse if adapter is bound to a public iface.
+                if self._host in ("127.0.0.1", "localhost", "::1"):
+                    self._app.router.add_post(
+                        "/internal/build_system_prompt", _p010_handle,
+                    )
+                    logger.info("[patch010] /internal/build_system_prompt registered")
+                else:
+                    logger.error(
+                        "[patch010] refusing to register on host=%s; bind 127.0.0.1",
+                        self._host,
+                    )
+            # <<< patch-010-debug-build-system-prompt <<<
+
+            
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
