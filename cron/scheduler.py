@@ -13,6 +13,7 @@ import concurrent.futures
 import contextvars
 import json
 import logging
+import logging.handlers
 import os
 import shutil
 import subprocess
@@ -42,6 +43,25 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+# Dedicated audit logger for cron fires. Writes a single structured line per
+# fire to ~/.hermes/logs/cron_audit.log so the true firing rate can be
+# reconciled against schedule.expr without grepping through noisy agent logs.
+_cron_audit = logging.getLogger("cron.audit")
+if not getattr(_cron_audit, "_hermes_configured", False):
+    _cron_audit.setLevel(logging.INFO)
+    _cron_audit.propagate = False  # don't double-log into agent.log
+    try:
+        _audit_path = get_hermes_home() / "logs" / "cron_audit.log"
+        _audit_path.parent.mkdir(parents=True, exist_ok=True)
+        _audit_handler = logging.handlers.RotatingFileHandler(
+            _audit_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8",
+        )
+        _audit_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _cron_audit.addHandler(_audit_handler)
+        _cron_audit._hermes_configured = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -1211,7 +1231,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
-    
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
@@ -1654,7 +1674,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -1771,7 +1791,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
@@ -1786,14 +1806,14 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 {logged_response}
 """
-        
+
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
-        
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
-        
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
@@ -1857,15 +1877,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
-    
+
     Uses a file lock so only one tick runs at a time, even if the gateway's
     in-process ticker and a standalone daemon or manual tick overlap.
-    
+
     Args:
         verbose: Whether to print status messages
         adapters: Optional dict mapping Platform → live adapter (from gateway)
         loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
+
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
@@ -1931,6 +1951,19 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
+                # Audit: record each fire so we can reconcile actual vs
+                # theoretical rate. Written to a dedicated logger so it can
+                # be tailed without wading through 90% asyncio noise.
+                _cron_audit.info(
+                    "FIRE job_id=%s name=%s expr=%s last_run=%s next_run=%s completed=%d",
+                    job.get("id"),
+                    job.get("name"),
+                    (job.get("schedule") or {}).get("expr"),
+                    job.get("last_run_at"),
+                    job.get("next_run_at"),
+                    (job.get("repeat") or {}).get("completed", 0),
+                )
+
                 success, output, final_response, error = run_job(job)
 
                 output_file = save_job_output(job["id"], output)
