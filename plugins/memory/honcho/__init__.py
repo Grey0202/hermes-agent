@@ -76,7 +76,11 @@ SEARCH_SCHEMA = {
         "Use this to recall specific past facts — 'what did I say about X', "
         "'what was the regimen/decision/config we settled on' — and reason "
         "over the excerpts yourself. For nuanced questions needing synthesis, "
-        "use honcho_reasoning instead."
+        "use honcho_reasoning instead. "
+        "PROACTIVELY trigger when: (a) user uses retrospective phrasing "
+        "('我之前/上次/记得/那个/before/last time/remember'); "
+        "(b) you need to cite a specific past fact not visible in current context; "
+        "(c) deciding whether to apply a prior decision or stated rule."
     ),
     "parameters": {
         "type": "object",
@@ -112,7 +116,12 @@ REASONING_SCHEMA = {
         "(cheap, raw excerpts, you synthesize). For standing profile facts, prefer "
         "honcho_profile / honcho_context (no LLM). "
         "Pass reasoning_level to control depth: minimal (fast/cheap), low (default), "
-        "medium, high, max (deep/expensive). Omit for the configured default."
+        "medium, high, max (deep/expensive). Omit for the configured default. "
+        "PROACTIVELY trigger when (use level=high): (a) user asks about own "
+        "preferences/dislikes/habits ('我对X怎么看/我喜欢/我反感'); "
+        "(b) you detect user current statement contradicts earlier observations; "
+        "(c) cross-session synthesis of user behavior required; "
+        "(d) user identity context insufficient for proper response."
     ),
     "parameters": {
         "type": "object",
@@ -196,7 +205,10 @@ CONCLUDE_SCHEMA = {
         "PII removal — for merely wrong facts, write a corrected conclusion instead; "
         "Honcho self-heals contradictions over time. This is a WRITE tool: to read "
         "the profile use honcho_profile / honcho_context, and to search what was "
-        "said use honcho_search."
+        "said use honcho_search. "
+        "PROACTIVELY trigger when user says '记住/以后/from now on' AND the content "
+        "is a state/fact change (job/account/holding/habit shift). "
+        "Short-term preferences belong in user-curated memory files, not here."
     ),
     "parameters": {
         "type": "object",

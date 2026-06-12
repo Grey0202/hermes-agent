@@ -1906,11 +1906,10 @@ class HindsightMemoryProvider(MemoryProvider):
                      sum(len(t) for t in turns_to_retain))
         content = "[" + ",".join(turns_to_retain) + "]"
 
+        # PATCH-022: session/parent tags removed for cross-session consolidation.
+        # See /root/.hermes/patches/022-hindsight-no-session-tag/README.md
+        # session_id remains in metadata field (audit trail preserved, not tag-filtered).
         lineage_tags: list[str] = []
-        if self._session_id:
-            lineage_tags.append(f"session:{self._session_id}")
-        if self._parent_session_id:
-            lineage_tags.append(f"parent:{self._parent_session_id}")
 
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
@@ -2092,11 +2091,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 message_count=len(old_turns) * 2,
                 turn_index=old_turn_index,
             )
+            # PATCH-022: see above. Old session flush also omits session tags.
             old_lineage_tags: list[str] = []
-            if old_session_id:
-                old_lineage_tags.append(f"session:{old_session_id}")
-            if old_parent_session_id:
-                old_lineage_tags.append(f"parent:{old_parent_session_id}")
             old_content = "[" + ",".join(old_turns) + "]"
             # Resolve doc_id + update_mode against the OLD session BEFORE
             # we rotate _session_id, so the flush lands in the old
