@@ -30,6 +30,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -4870,6 +4871,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         self._enqueue_fifo(session_key, event, adapter)
+
+    @staticmethod
+    def _event_has_image_media(event: Optional[MessageEvent]) -> bool:
+        if event is None:
+            return False
+        media_urls = getattr(event, "media_urls", None) or []
+        if not media_urls:
+            return False
+        if getattr(event, "message_type", None) == MessageType.PHOTO:
+            return True
+        media_types = getattr(event, "media_types", None) or []
+        return any(str(mtype).startswith("image/") for mtype in media_types)
+
+    def _pop_adapter_pending_image_event(self, adapter: Any, session_key: str) -> Optional[MessageEvent]:
+        pending_messages = getattr(adapter, "_pending_messages", None)
+        if not pending_messages:
+            return None
+        pending_event = pending_messages.get(session_key)
+        if not self._event_has_image_media(pending_event):
+            return None
+        return pending_messages.pop(session_key, None)
+
+    @staticmethod
+    def _adapter_declared_method(adapter: Any, name: str) -> Optional[Callable[..., Any]]:
+        try:
+            inspect.getattr_static(adapter, name)
+        except AttributeError:
+            return None
+        method = getattr(adapter, name, None)
+        return method if callable(method) else None
+
+    @staticmethod
+    def _startup_media_grace_seconds() -> float:
+        raw = os.getenv("HERMES_TELEGRAM_STARTUP_MEDIA_GRACE_SECONDS", "1.0")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 1.0
+        if not math.isfinite(value):
+            value = 1.0
+        return max(0.0, min(value, 3.0))
+
+    async def _merge_startup_media_followups(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> MessageEvent:
+        """Merge media that arrived while a text turn was starting.
+
+        Telegram short-text batches intentionally flush quickly, while photo
+        batches wait longer to collect albums/bursts.  WeChat (Weixin/iLink)
+        delivers a photo and its caption text as two independent inbound
+        events, and the lightweight text routinely reaches the runner before
+        the image finishes downloading — so a back-to-back "question text" +
+        screenshot send can start a text-only agent turn before the image
+        reaches the normal image-routing path.  Just before the first model
+        request, steal any pending image follow-up for the same session and
+        fold it into the current user event.
+
+        Upstream parity: this mirrors PR #33272 (Fixes #33270), extended to
+        cover WeChat via the platform-agnostic pending-image pop.  Telegram's
+        in-progress-download helpers (``pop_startup_media_event`` /
+        ``has_startup_media_pending``) are looked up dynamically and simply
+        no-op for adapters (like WeChat) that do not declare them.
+        """
+        if (
+            source.platform not in (Platform.TELEGRAM, Platform.WEIXIN)
+            or event.message_type != MessageType.TEXT
+            or self._event_has_image_media(event)
+        ):
+            return event
+
+        adapter = self.adapters.get(source.platform)
+        if adapter is None:
+            return event
+
+        grace = self._startup_media_grace_seconds()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace
+        merged_count = 0
+        pop_startup_media_event = self._adapter_declared_method(adapter, "pop_startup_media_event")
+        has_startup_media_pending = self._adapter_declared_method(adapter, "has_startup_media_pending")
+
+        while True:
+            incoming = self._pop_adapter_pending_image_event(adapter, session_key)
+            if incoming is None and pop_startup_media_event is not None:
+                try:
+                    incoming = pop_startup_media_event(session_key)
+                except Exception:
+                    logger.debug("Startup media pop failed", exc_info=True)
+                    incoming = None
+
+            if incoming is not None:
+                slot = {session_key: event}
+                merge_pending_message_event(slot, session_key, incoming)
+                event = slot[session_key]
+                merged_count += len(getattr(incoming, "media_urls", None) or [])
+                continue
+
+            has_pending = False
+            if has_startup_media_pending is not None:
+                try:
+                    has_pending = bool(has_startup_media_pending(session_key))
+                except Exception:
+                    logger.debug("Startup media pending check failed", exc_info=True)
+                    has_pending = False
+            if not has_pending or loop.time() >= deadline:
+                break
+            await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
+
+        if merged_count:
+            logger.info(
+                "Merged %d startup image(s) into text turn for session %s (platform=%s)",
+                merged_count,
+                session_key,
+                source.platform.value if hasattr(source.platform, "value") else source.platform,
+            )
+        return event
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -10825,6 +10945,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
+        event = await self._merge_startup_media_followups(event, source, session_key)
         message_text = await self._prepare_inbound_message_text(
             event=event,
             source=source,

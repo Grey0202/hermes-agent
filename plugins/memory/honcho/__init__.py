@@ -66,7 +66,11 @@ SEARCH_SCHEMA = {
         "Semantic search over Honcho's stored context about a peer. "
         "Returns raw excerpts ranked by relevance — no LLM synthesis. "
         "Cheaper and faster than honcho_reasoning. "
-        "Good when you want to find specific past facts and reason over them yourself."
+        "Good when you want to find specific past facts and reason over them yourself. "
+        "PROACTIVELY trigger when: (a) user uses retrospective phrasing "
+        "('我之前/上次/记得/那个/before/last time/remember'); "
+        "(b) you need to cite a specific past fact not visible in current context; "
+        "(c) deciding whether to apply a prior decision or stated rule."
     ),
     "parameters": {
         "type": "object",
@@ -95,7 +99,12 @@ REASONING_SCHEMA = {
         "Uses Honcho's LLM (dialectic reasoning) — higher cost than honcho_profile or honcho_search. "
         "Can query about any peer via alias or explicit peer ID. "
         "Pass reasoning_level to control depth: minimal (fast/cheap), low (default), "
-        "medium, high, max (deep/expensive). Omit for configured default."
+        "medium, high, max (deep/expensive). Omit for configured default. "
+        "PROACTIVELY trigger when (use level=high): (a) user asks about own "
+        "preferences/dislikes/habits ('我对X怎么看/我喜欢/我反感'); "
+        "(b) you detect user current statement contradicts earlier observations; "
+        "(c) cross-session synthesis of user behavior required; "
+        "(d) user identity context insufficient for proper response."
     ),
     "parameters": {
         "type": "object",
@@ -158,7 +167,10 @@ CONCLUDE_SCHEMA = {
         "Conclusions are persistent facts that build a peer's profile. "
         "You MUST pass exactly one of: `conclusion` (to create) or `delete_id` (to delete). "
         "Passing neither is an error. "
-        "Deletion is only for PII removal — Honcho self-heals incorrect conclusions over time."
+        "Deletion is only for PII removal — Honcho self-heals incorrect conclusions over time. "
+        "PROACTIVELY trigger when user says '记住/以后/from now on' AND the content "
+        "is a state/fact change (job/account/holding/habit shift). "
+        "Short-term preferences belong in user-curated memory files, not here."
     ),
     "parameters": {
         "type": "object",

@@ -14,6 +14,7 @@ import concurrent.futures
 import contextvars
 import json
 import logging
+import logging.handlers
 import os
 import re
 import shutil
@@ -45,6 +46,25 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+# Dedicated audit logger for cron fires. Writes a single structured line per
+# fire to ~/.hermes/logs/cron_audit.log so the true firing rate can be
+# reconciled against schedule.expr without grepping through noisy agent logs.
+_cron_audit = logging.getLogger("cron.audit")
+if not getattr(_cron_audit, "_hermes_configured", False):
+    _cron_audit.setLevel(logging.INFO)
+    _cron_audit.propagate = False  # don't double-log into agent.log
+    try:
+        _audit_path = get_hermes_home() / "logs" / "cron_audit.log"
+        _audit_path.parent.mkdir(parents=True, exist_ok=True)
+        _audit_handler = logging.handlers.RotatingFileHandler(
+            _audit_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8",
+        )
+        _audit_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _cron_audit.addHandler(_audit_handler)
+        _cron_audit._hermes_configured = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -3110,7 +3130,37 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
+            # local patch: record a CLAIM_SKIP audit event (same field set as
+            # FIRE below) so the audit stream stays complete instead of
+            # showing a silent gap when a job is skipped by the dispatch
+            # claim (see feedback on FIRE-log placement below).
+            _cron_audit.info(
+                "CLAIM_SKIP job_id=%s name=%s expr=%s last_run=%s next_run=%s completed=%d",
+                job.get("id"),
+                job.get("name"),
+                (job.get("schedule") or {}).get("expr"),
+                job.get("last_run_at"),
+                job.get("next_run_at"),
+                (job.get("repeat") or {}).get("completed", 0),
+            )
             return True  # not an error — already handled/removed
+
+        # local patch: audit log moved to AFTER the dispatch claim passes
+        # (was previously logged before the claim check existed upstream);
+        # logging FIRE before the claim would misrecord claim-skipped runs
+        # as fired, inflating actual-vs-theoretical fire-rate audits.
+        # Audit: record each fire so we can reconcile actual vs
+        # theoretical rate. Written to a dedicated logger so it can
+        # be tailed without wading through 90% asyncio noise.
+        _cron_audit.info(
+            "FIRE job_id=%s name=%s expr=%s last_run=%s next_run=%s completed=%d",
+            job.get("id"),
+            job.get("name"),
+            (job.get("schedule") or {}).get("expr"),
+            job.get("last_run_at"),
+            job.get("next_run_at"),
+            (job.get("repeat") or {}).get("completed", 0),
+        )
 
         success, output, final_response, error = run_job(job)
 
