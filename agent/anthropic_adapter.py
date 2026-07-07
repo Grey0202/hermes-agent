@@ -1224,7 +1224,7 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
             logger.debug("Successfully refreshed Claude Code OAuth token (lock + CAS held)")
             return refreshed["access_token"]
         except Exception as e:
-            logger.debug("Failed to refresh Claude Code token: %s", e)
+            logger.warning("Failed to refresh Claude Code token: %s", e)
             return None
     finally:
         _release_oauth_lock(lock_fh)
