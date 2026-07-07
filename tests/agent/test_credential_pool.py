@@ -2024,3 +2024,78 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+def test_refresh_tokenless_claude_code_entry_hydrates_instead_of_exhausting(tmp_path, monkeypatch):
+    """A tokenless anthropic claude_code entry must hydrate from the credentials
+    file on refresh, NOT get tombstoned as exhausted (adapted from upstream PR #58096).
+
+    Regression: a claude_code pool entry that carries no refresh_token in
+    auth.json (it resolves lazily from ~/.claude/.credentials.json) was sent
+    straight to _mark_exhausted(None) in _refresh_entry. That STATUS_EXHAUSTED
+    (1h TTL) then persisted to the SHARED auth.json and poisoned every gateway +
+    cron until a full restart. The fix hydrates from the credentials file first
+    and only tombstones if that yields no usable refresh token.
+    """
+    from dataclasses import replace as dc_replace
+    from agent.credential_pool import STATUS_EXHAUSTED
+
+    pool, entry = _make_anthropic_claude_code_pool(
+        tmp_path, monkeypatch,
+        access_token="stale-access",
+        refresh_token="stale-refresh",
+    )
+
+    tokenless = dc_replace(entry, access_token="", refresh_token="")
+    pool._replace_entry(entry, tokenless)
+
+    monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: {"accessToken": "live-access", "refreshToken": "live-refresh", "expiresAt": 9_999_999_999_000},
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "live-access",
+            "refresh_token": "live-refresh",
+            "expires_at_ms": 9_999_999_999_000,
+        },
+    )
+
+    result = pool._refresh_entry(tokenless, force=True)
+
+    assert result is not None, "tokenless claude_code entry must hydrate, not return None"
+    assert result.refresh_token == "live-refresh"
+    assert result.last_status != STATUS_EXHAUSTED
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    for cred in persisted["credential_pool"]["anthropic"]:
+        assert cred.get("last_status") != STATUS_EXHAUSTED
+
+
+def test_refresh_tokenless_claude_code_entry_exhausts_when_no_creds_file(tmp_path, monkeypatch):
+    """If the credentials file has nothing usable, a forced refresh of a
+    tokenless claude_code entry still falls through to exhaustion (unchanged
+    behavior for the genuinely-dead case). Adapted from upstream PR #58096."""
+    from dataclasses import replace as dc_replace
+    from agent.credential_pool import STATUS_EXHAUSTED, STATUS_DEAD
+
+    pool, entry = _make_anthropic_claude_code_pool(
+        tmp_path, monkeypatch,
+        access_token="stale-access",
+        refresh_token="stale-refresh",
+    )
+    tokenless = dc_replace(entry, access_token="", refresh_token="")
+    pool._replace_entry(entry, tokenless)
+
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: None,
+    )
+
+    result = pool._refresh_entry(tokenless, force=True)
+
+    assert result is None
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    statuses = {c.get("last_status") for c in persisted["credential_pool"]["anthropic"]}
+    assert statuses & {STATUS_EXHAUSTED, STATUS_DEAD}
