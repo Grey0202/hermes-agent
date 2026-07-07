@@ -91,6 +91,40 @@ def _is_interactive_cli() -> bool:
     return env_var_enabled("HERMES_INTERACTIVE")
 
 
+# Per-context cron-session flag. The scheduler can tick cron IN-PROCESS with
+# the gateway, so the old process-global os.environ["HERMES_CRON_SESSION"]
+# marker leaked into concurrent interactive sessions once any job had run.
+# A contextvar is carried across the scheduler -> agent worker -> tool worker
+# thread hops by copy_context()/propagate_context_to_thread(). None = unset
+# -> fall back to the env var for out-of-process callers (CLI, tests).
+_cron_session_ctx: contextvars.ContextVar[Optional[bool]] = contextvars.ContextVar(
+    "hermes_cron_session",
+    default=None,
+)
+
+
+def set_cron_session_context(active: bool) -> contextvars.Token:
+    """Bind cron-session mode for the current context (thread or asyncio task)."""
+    return _cron_session_ctx.set(active)
+
+
+def reset_cron_session_context(token: contextvars.Token) -> None:
+    """Restore the prior value from :func:`set_cron_session_context`."""
+    _cron_session_ctx.reset(token)
+
+
+def _is_cron_session() -> bool:
+    """True when running inside a cron job's execution context.
+
+    Prefers the context-local flag (set by ``cron/scheduler.py::run_job``)
+    and falls back to the ``HERMES_CRON_SESSION`` env var.
+    """
+    ctx_val = _cron_session_ctx.get()
+    if ctx_val is not None:
+        return bool(ctx_val)
+    return env_var_enabled("HERMES_CRON_SESSION")
+
+
 def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     """Invoke a plugin lifecycle hook for the approval system.
 
@@ -189,7 +223,7 @@ def _is_gateway_approval_context() -> bool:
     fall through to the gateway branch would submit a pending approval
     with no listener and block the job indefinitely.
     """
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_session():
         return False
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
@@ -2002,7 +2036,7 @@ def check_dangerous_command(command: str, env_type: str,
 
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        if _is_cron_session():
             if _get_cron_approval_mode() == "deny":
                 return {
                     "approved": False,
@@ -2263,9 +2297,13 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    # Cron sessions ALWAYS take this branch: the gateway process exports
+    # HERMES_EXEC_ASK=1 (gateway/run.py), which previously diverted cron
+    # commands into the gateway ask path — a pending approval with no
+    # listener that failed the command instantly.
+    if _is_cron_session() or (not is_cli and not is_gateway and not is_ask):
         # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        if _is_cron_session():
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
@@ -2652,7 +2690,7 @@ def check_execute_code_guard(code: str, env_type: str,
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Cron: no user is present to approve arbitrary code.
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    if _is_cron_session():
         if _get_cron_approval_mode() == "deny":
             return {
                 "approved": False,

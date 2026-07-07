@@ -2459,9 +2459,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     agent = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
+    # Context-local, NOT os.environ: the gateway ticks cron in-process, so the
+    # old process-global env flag leaked into concurrent interactive sessions
+    # once any job had run (2026-07-07: weixin DM hit the cron-only
+    # execute_code block). copy_context() at the agent-run submit carries it
+    # into the agent worker; tool_executor propagates it into tool threads.
+    from tools.approval import set_cron_session_context
+    _cron_flag_token = set_cron_session_context(True)
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -3059,6 +3063,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _terminal_cwd_lock.release_read()
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
+        from tools.approval import reset_cron_session_context
+        reset_cron_session_context(_cron_flag_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
