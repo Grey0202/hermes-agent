@@ -11,6 +11,27 @@ The plugin records the (provider, model) of the first API call of a session as
 that session's primary; any later call with a different (provider, model)
 triggers a Telegram message. Throttled per session.
 
+Cold-start detection (fork amendment 2026-07-08)
+------------------------------------------------
+Mid-session diffing has a blind spot: when the primary auth dies *before* a
+session's first API call (the 2026-07-02 and 2026-07-08 incidents), the very
+first call is already served by the fallback, so it becomes the recorded
+"primary" and no later divergence is ever seen -> no alert fires. To close
+this, the plugin now reads the gateway's configured primary and fallback
+providers from ``config.yaml`` at registration time. If a session's *first*
+observed (provider, model) already matches a configured fallback entry, an
+alert fires immediately.
+
+We key the cold-start signal on membership in the configured fallback set
+(not merely "differs from the configured primary") on purpose: this
+deployment legitimately runs many cron sessions pinned to non-default
+providers (e.g. glm-*), and normal human sessions may report a different
+Anthropic model (opus vs the config default) than ``model.default``. A
+"differs from primary" rule would false-alarm on all of those; matching the
+fallback set fires only on genuine failover to the configured backup
+(custom:deepseek / deepseek-v4-pro). Exotic tertiary fallbacks are still
+caught by the 30-min ``anthropic_cred_watch.py`` Check A backstop.
+
 Fork adaptation
 ---------------
 This deployment already exports the gateway's Telegram bot token and home
@@ -26,6 +47,9 @@ FALLBACK_ALERT_TELEGRAM_BOT_TOKEN | TELEGRAM_BOT_TOKEN   -- bot token
 FALLBACK_ALERT_TELEGRAM_CHAT_ID   | TELEGRAM_HOME_CHANNEL -- target chat id / @channel
 FALLBACK_ALERT_THROTTLE_SECONDS   -- min seconds between alerts per session (default 300)
 FALLBACK_ALERT_DEBUG              -- ``true`` to log no-op reasons at INFO level
+FALLBACK_ALERT_FALLBACK_MODELS    -- comma-separated model names treated as fallback for
+                                     cold-start detection; a safe fallback used when
+                                     config.yaml cannot be read (empty => cold-start off)
 """
 from __future__ import annotations
 
@@ -45,9 +69,89 @@ _PRIMARY_BY_SESSION: Dict[str, Tuple[str, str]] = {}
 _LAST_ALERT_BY_SESSION: Dict[str, float] = {}
 _STATE_LOCK = threading.Lock()
 
+# Configured expectations, populated once at register() time from config.yaml.
+# ``_EXPECTED_PRIMARY`` is the (provider, model) the gateway is configured to
+# use by default; ``_FALLBACK_PAIRS`` / ``_FALLBACK_MODELS`` are the configured
+# failover targets used for cold-start detection. All empty/None => cold-start
+# detection is disabled (safe degradation).
+_EXPECTED_PRIMARY: Optional[Tuple[str, str]] = None
+_FALLBACK_PAIRS: set = set()
+_FALLBACK_MODELS: set = set()
+
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def _config_path() -> str:
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return os.path.join(home, "config.yaml")
+
+
+def _load_config_expectations() -> None:
+    """Read primary + fallback providers from config.yaml (once, at register).
+
+    Never raises: on any error the expectations are left empty, which disables
+    cold-start detection and preserves the plugin's prior behaviour.
+    """
+    global _EXPECTED_PRIMARY, _FALLBACK_PAIRS, _FALLBACK_MODELS
+    primary: Optional[Tuple[str, str]] = None
+    pairs: set = set()
+    models: set = set()
+
+    try:
+        import yaml  # pyyaml is a hard hermes dependency; import lazily anyway
+
+        with open(_config_path()) as fh:
+            cfg = yaml.safe_load(fh) or {}
+        model_cfg = cfg.get("model") or {}
+        p_provider = str(model_cfg.get("provider") or "").strip()
+        p_model = str(model_cfg.get("default") or "").strip()
+        if p_provider or p_model:
+            primary = (p_provider, p_model)
+        for entry in cfg.get("fallback_providers") or []:
+            if not isinstance(entry, dict):
+                continue
+            fp = str(entry.get("provider") or "").strip()
+            fm = str(entry.get("model") or "").strip()
+            if fp or fm:
+                pairs.add((fp, fm))
+            if fm:
+                models.add(fm)
+    except Exception as exc:  # noqa: BLE001 — config read must never break the plugin
+        logger.warning("fallback-alert: could not read config.yaml expectations: %s", exc)
+
+    # Env fallback/override: an operator can hard-set the fallback model list
+    # (comma-separated) when config.yaml is unavailable or when overriding.
+    env_models = _env("FALLBACK_ALERT_FALLBACK_MODELS")
+    if env_models:
+        for tok in env_models.split(","):
+            tok = tok.strip()
+            if tok:
+                models.add(tok)
+
+    _EXPECTED_PRIMARY = primary
+    _FALLBACK_PAIRS = pairs
+    _FALLBACK_MODELS = models
+    if _debug_enabled():
+        logger.info(
+            "fallback-alert: expected_primary=%s fallback_pairs=%s fallback_models=%s",
+            primary, sorted(pairs), sorted(models),
+        )
+
+
+def _is_cold_start_fallback(current: Tuple[str, str]) -> bool:
+    """True when a session's *first* call is already on a configured fallback.
+
+    Membership in the configured fallback set (not "differs from primary") is
+    the discriminator — see the module docstring for why.
+    """
+    if _EXPECTED_PRIMARY is not None and current == _EXPECTED_PRIMARY:
+        return False
+    if current in _FALLBACK_PAIRS:
+        return True
+    _, model = current
+    return bool(model) and model in _FALLBACK_MODELS
 
 
 def _debug_enabled() -> bool:
@@ -111,6 +215,7 @@ def _format_message(
     primary: Tuple[str, str],
     current: Tuple[str, str],
     finish_reason: str = "",
+    cold_start: bool = False,
 ) -> str:
     p_provider, p_model = primary
     c_provider, c_model = current
@@ -121,7 +226,11 @@ def _format_message(
     ]
     if platform:
         lines.append(f"*platform:* `{platform}`")
-    lines.append(f"*primary:* `{p_provider}/{p_model}`")
+    if cold_start:
+        lines.append("*cold start:* first API call already on fallback (primary never observed)")
+        lines.append(f"*expected primary:* `{p_provider}/{p_model}`")
+    else:
+        lines.append(f"*primary:* `{p_provider}/{p_model}`")
     lines.append(f"*now:* `{c_provider}/{c_model}`")
     if finish_reason:
         lines.append(f"*finish_reason:* `{finish_reason}`")
@@ -149,21 +258,31 @@ def on_post_api_request(**kwargs) -> None:
 
         current = (provider, model)
         primary: Optional[Tuple[str, str]] = None
+        cold_start = False
 
         with _STATE_LOCK:
             stored = _PRIMARY_BY_SESSION.get(session_id)
             if stored is None:
+                # First call of the session: record it as the baseline for
+                # mid-session diffing (unchanged behaviour).
                 _PRIMARY_BY_SESSION[session_id] = current
-                if _debug_enabled():
-                    logger.info(
-                        "fallback-alert: recorded primary %s for session %r",
-                        current,
-                        session_id,
-                    )
-                return
-            if stored == current:
-                return  # still on primary — silent
-            primary = stored
+                if not _is_cold_start_fallback(current):
+                    if _debug_enabled():
+                        logger.info(
+                            "fallback-alert: recorded primary %s for session %r",
+                            current,
+                            session_id,
+                        )
+                    return
+                # ...but if that first call is already on a configured fallback,
+                # the primary was never healthy this session and mid-session
+                # diffing would never fire — alert now (cold-start fix).
+                cold_start = True
+                primary = _EXPECTED_PRIMARY or current
+            elif stored == current:
+                return  # still on baseline — silent
+            else:
+                primary = stored
 
             now = time.time()
             last = _LAST_ALERT_BY_SESSION.get(session_id, 0.0)
@@ -184,6 +303,7 @@ def on_post_api_request(**kwargs) -> None:
             primary=primary,
             current=current,
             finish_reason=str(kwargs.get("finish_reason") or ""),
+            cold_start=cold_start,
         )
         _send_telegram(token, chat_id, text)
     except Exception as exc:
@@ -197,6 +317,15 @@ def _reset_state_for_tests() -> None:
         _LAST_ALERT_BY_SESSION.clear()
 
 
+def _configure_for_tests(expected_primary, fallback_pairs=None, fallback_models=None) -> None:
+    """Test helper — set configured expectations without reading config.yaml."""
+    global _EXPECTED_PRIMARY, _FALLBACK_PAIRS, _FALLBACK_MODELS
+    _EXPECTED_PRIMARY = expected_primary
+    _FALLBACK_PAIRS = set(fallback_pairs or [])
+    _FALLBACK_MODELS = set(fallback_models or [])
+
+
 def register(ctx) -> None:
     """Plugin entrypoint, called by the Hermes plugin manager on activation."""
+    _load_config_expectations()
     ctx.register_hook("post_api_request", on_post_api_request)
