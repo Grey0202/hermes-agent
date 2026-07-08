@@ -17,10 +17,10 @@ Mid-session diffing has a blind spot: when the primary auth dies *before* a
 session's first API call (the 2026-07-02 and 2026-07-08 incidents), the very
 first call is already served by the fallback, so it becomes the recorded
 "primary" and no later divergence is ever seen -> no alert fires. To close
-this, the plugin now reads the gateway's configured primary and fallback
-providers from ``config.yaml`` at registration time. If a session's *first*
-observed (provider, model) already matches a configured fallback entry, an
-alert fires immediately.
+this, the plugin reads the gateway's configured primary and fallback providers
+from ``config.yaml`` at registration time. If a session's *first* observed
+(provider, model) already matches a configured fallback entry, an alert fires
+immediately.
 
 We key the cold-start signal on membership in the configured fallback set
 (not merely "differs from the configured primary") on purpose: this
@@ -31,6 +31,34 @@ Anthropic model (opus vs the config default) than ``model.default``. A
 fallback set fires only on genuine failover to the configured backup
 (custom:deepseek / deepseek-v4-pro). Exotic tertiary fallbacks are still
 caught by the 30-min ``anthropic_cred_watch.py`` Check A backstop.
+
+Per-session primary attribution + two-tier alerting (fork amendment 2026-07-08b)
+--------------------------------------------------------------------------------
+The cold-start fix above labelled the "expected primary" with the *global*
+``config.yaml`` default (anthropic/claude-fable-5). That is wrong for sessions
+that run on a per-session configured primary — most importantly cron jobs
+pinned to a specific provider/model (e.g. ``A股收盘报`` → glm-coding/glm-5.2).
+A routine GLM 429 → deepseek failover was therefore reported as if the
+Anthropic primary had failed, which reads as an auth incident.
+
+Two changes:
+
+1. **Correct attribution.** For a mid-session divergence the recorded first
+   call *is* the real per-session primary, so it is used directly. For a
+   cold-start on a cron session (``cron_<jobid>_<date>_<time>``) the real
+   primary is read from ``cron/jobs.json`` (the per-job ``provider`` / ``model``
+   / ``name``). Only when no per-session value is resolvable does it fall back
+   to the global ``config.yaml`` default.
+
+2. **Two-tier severity.** If the expected primary is Anthropic (provider
+   ``anthropic`` or a ``claude*`` model), the original prominent
+   ``*Hermes fallback activated*`` alert is sent unchanged — this is the
+   Anthropic-auth signal the user actually cares about, and it is never
+   deduped. If the expected primary is *not* Anthropic (e.g. glm → deepseek),
+   a calmer low-priority message is sent instead, explicitly stating the real
+   primary and that Anthropic is unaffected. Low-tier messages are deduped to
+   at most one per (job/session-prefix, expected-primary, day), persisted to a
+   small JSON state file so the cooldown survives a gateway restart.
 
 Fork adaptation
 ---------------
@@ -56,6 +84,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -69,6 +98,14 @@ _PRIMARY_BY_SESSION: Dict[str, Tuple[str, str]] = {}
 _LAST_ALERT_BY_SESSION: Dict[str, float] = {}
 _STATE_LOCK = threading.Lock()
 
+# Low-tier dedupe: key = "<session_prefix>|<provider>/<model>|<YYYYMMDD>" -> epoch.
+# In-memory dict, best-effort persisted to a JSON state file so the daily
+# cooldown survives gateway restarts. Never applied to high-tier alerts.
+_LOWTIER_SENT: Dict[str, float] = {}
+
+# Cron job index cache: {"mtime": <float|None>, "jobs": {jobid: {name, provider, model}}}.
+_CRON_CACHE: Dict[str, object] = {"mtime": None, "jobs": {}}
+
 # Configured expectations, populated once at register() time from config.yaml.
 # ``_EXPECTED_PRIMARY`` is the (provider, model) the gateway is configured to
 # use by default; ``_FALLBACK_PAIRS`` / ``_FALLBACK_MODELS`` are the configured
@@ -78,14 +115,28 @@ _EXPECTED_PRIMARY: Optional[Tuple[str, str]] = None
 _FALLBACK_PAIRS: set = set()
 _FALLBACK_MODELS: set = set()
 
+_CRON_SESSION_RE = re.compile(r"^cron_([0-9A-Za-z]+)_\d{8}_\d{6}")
+_LOWTIER_STATE_TTL_S = 2 * 86400  # prune dedupe keys older than 2 days on load
+
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+def _hermes_home() -> str:
+    return os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+
+
 def _config_path() -> str:
-    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return os.path.join(home, "config.yaml")
+    return os.path.join(_hermes_home(), "config.yaml")
+
+
+def _cron_jobs_path() -> str:
+    return os.path.join(_hermes_home(), "cron", "jobs.json")
+
+
+def _lowtier_state_path() -> str:
+    return os.path.join(_hermes_home(), "fallback_alert_lowtier_state.json")
 
 
 def _load_config_expectations() -> None:
@@ -140,6 +191,89 @@ def _load_config_expectations() -> None:
         )
 
 
+def _load_lowtier_state() -> None:
+    """Load the persisted low-tier dedupe keys (once, at register).
+
+    Prunes keys older than the TTL so the file stays bounded. Never raises.
+    """
+    global _LOWTIER_SENT
+    try:
+        with open(_lowtier_state_path()) as fh:
+            data = json.load(fh) or {}
+        cutoff = time.time() - _LOWTIER_STATE_TTL_S
+        _LOWTIER_SENT = {
+            str(k): float(v)
+            for k, v in data.items()
+            if _safe_float(v) >= cutoff
+        }
+    except FileNotFoundError:
+        _LOWTIER_SENT = {}
+    except Exception as exc:  # noqa: BLE001 — state read must never break the plugin
+        logger.warning("fallback-alert: could not read low-tier state: %s", exc)
+        _LOWTIER_SENT = {}
+
+
+def _safe_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _persist_lowtier_state() -> None:
+    """Best-effort atomic write of the low-tier dedupe keys. Never raises."""
+    try:
+        path = _lowtier_state_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(_LOWTIER_SENT, fh)
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fallback-alert: could not persist low-tier state: %s", exc)
+
+
+def _lookup_cron_job(session_id: str) -> Optional[Dict[str, str]]:
+    """Resolve a cron session id to its configured job {name, provider, model}.
+
+    Cron session ids look like ``cron_<jobid>_<YYYYMMDD>_<HHMMSS>``. Reads
+    ``cron/jobs.json`` with an mtime-keyed cache. Returns None for non-cron
+    sessions or on any error (never raises).
+    """
+    m = _CRON_SESSION_RE.match(session_id or "")
+    if not m:
+        return None
+    jobid = m.group(1)
+    try:
+        path = _cron_jobs_path()
+        st = os.stat(path)
+        if _CRON_CACHE.get("mtime") != st.st_mtime:
+            with open(path) as fh:
+                data = json.load(fh)
+            jobs = data.get("jobs") if isinstance(data, dict) else data
+            idx: Dict[str, Dict[str, str]] = {}
+            for j in (jobs or []):
+                if isinstance(j, dict) and j.get("id"):
+                    idx[str(j["id"])] = {
+                        "name": str(j.get("name") or "").strip(),
+                        "provider": str(j.get("provider") or "").strip(),
+                        "model": str(j.get("model") or "").strip(),
+                    }
+            _CRON_CACHE["mtime"] = st.st_mtime
+            _CRON_CACHE["jobs"] = idx
+        return _CRON_CACHE["jobs"].get(jobid)  # type: ignore[union-attr]
+    except Exception as exc:  # noqa: BLE001 — jobs.json read must never break the plugin
+        logger.warning("fallback-alert: could not read cron jobs.json: %s", exc)
+        return None
+
+
+def _session_prefix(session_id: str) -> str:
+    """Stable dedupe prefix: ``cron_<jobid>`` for cron sessions, else a truncation."""
+    m = _CRON_SESSION_RE.match(session_id or "")
+    if m:
+        return "cron_" + m.group(1)
+    return (session_id or "")[:32]
+
+
 def _is_cold_start_fallback(current: Tuple[str, str]) -> bool:
     """True when a session's *first* call is already on a configured fallback.
 
@@ -152,6 +286,12 @@ def _is_cold_start_fallback(current: Tuple[str, str]) -> bool:
         return True
     _, model = current
     return bool(model) and model in _FALLBACK_MODELS
+
+
+def _is_anthropic_primary(primary: Tuple[str, str]) -> bool:
+    """True when the expected primary is Anthropic (high-tier signal)."""
+    provider, model = primary
+    return provider.strip().lower() == "anthropic" or model.strip().lower().startswith("claude")
 
 
 def _debug_enabled() -> bool:
@@ -208,22 +348,29 @@ def _send_telegram(token: str, chat_id: str, text: str) -> bool:
     return False
 
 
-def _format_message(
+def _session_label(session_id: str) -> str:
+    return (session_id[:24] + "…") if len(session_id) > 24 else (session_id or "<no session>")
+
+
+def _format_high_tier(
     *,
     session_id: str,
     platform: str,
+    job_name: str,
     primary: Tuple[str, str],
     current: Tuple[str, str],
     finish_reason: str = "",
     cold_start: bool = False,
 ) -> str:
+    """The original prominent alert — Anthropic-primary fallbacks only."""
     p_provider, p_model = primary
     c_provider, c_model = current
-    session_short = (session_id[:24] + "…") if len(session_id) > 24 else session_id
     lines = [
         "*Hermes fallback activated*",
-        f"*session:* `{session_short or '<no session>'}`",
+        f"*session:* `{_session_label(session_id)}`",
     ]
+    if job_name:
+        lines.append(f"*job:* `{job_name}`")
     if platform:
         lines.append(f"*platform:* `{platform}`")
     if cold_start:
@@ -235,6 +382,31 @@ def _format_message(
     if finish_reason:
         lines.append(f"*finish_reason:* `{finish_reason}`")
     return "\n".join(lines)
+
+
+def _format_low_tier(
+    *,
+    session_id: str,
+    platform: str,
+    job_name: str,
+    primary: Tuple[str, str],
+    current: Tuple[str, str],
+    cold_start: bool = False,
+) -> str:
+    """Calmer, low-noise message — non-Anthropic primary fell back."""
+    p = f"{primary[0]}/{primary[1]}"
+    c = f"{current[0]}/{current[1]}"
+    if job_name:
+        who = f"cron {job_name}"
+    elif platform:
+        who = f"{platform} `{_session_label(session_id)}`"
+    else:
+        who = f"`{_session_label(session_id)}`"
+    trigger = "首个调用即触发" if cold_start else "触发"
+    return (
+        f"Hermes 低优提示: {who} primary {p} {trigger} fallback → {c}"
+        f"（provider 侧限流/瞬时错误，与 anthropic 无关，无需处理）"
+    )
 
 
 def on_post_api_request(**kwargs) -> None:
@@ -257,6 +429,12 @@ def on_post_api_request(**kwargs) -> None:
             return
 
         current = (provider, model)
+        # Resolve the per-session configured job once (cron sessions only);
+        # used both to attribute the real primary on cold-start and to name
+        # the job in either tier.
+        job = _lookup_cron_job(session_id)
+        job_name = (job or {}).get("name", "")
+
         primary: Optional[Tuple[str, str]] = None
         cold_start = False
 
@@ -276,13 +454,24 @@ def on_post_api_request(**kwargs) -> None:
                     return
                 # ...but if that first call is already on a configured fallback,
                 # the primary was never healthy this session and mid-session
-                # diffing would never fire — alert now (cold-start fix).
+                # diffing would never fire — alert now (cold-start fix). The
+                # real primary is the per-job value (cron) or, failing that,
+                # the global config default; never the observed fallback itself.
                 cold_start = True
-                primary = _EXPECTED_PRIMARY or current
+                if job and (job.get("provider") or job.get("model")):
+                    primary = (job.get("provider", ""), job.get("model", ""))
+                elif _EXPECTED_PRIMARY:
+                    primary = _EXPECTED_PRIMARY
+                else:
+                    primary = current
             elif stored == current:
                 return  # still on baseline — silent
             else:
+                # Mid-session divergence: the recorded first call IS the real
+                # per-session primary.
                 primary = stored
+
+            high_tier = _is_anthropic_primary(primary)
 
             now = time.time()
             last = _LAST_ALERT_BY_SESSION.get(session_id, 0.0)
@@ -294,17 +483,44 @@ def on_post_api_request(**kwargs) -> None:
                         session_id,
                     )
                 return
+
+            # Low-tier only: dedupe to one message per (prefix, primary, day).
+            # High-tier (Anthropic) alerts are never deduped/suppressed here.
+            if not high_tier:
+                day = time.strftime("%Y%m%d", time.localtime(now))
+                dedupe_key = f"{_session_prefix(session_id)}|{primary[0]}/{primary[1]}|{day}"
+                if dedupe_key in _LOWTIER_SENT:
+                    if _debug_enabled():
+                        logger.info(
+                            "fallback-alert: low-tier deduped (key=%s)", dedupe_key
+                        )
+                    return
+                _LOWTIER_SENT[dedupe_key] = now
+                _persist_lowtier_state()
+
             _LAST_ALERT_BY_SESSION[session_id] = now
 
         token, chat_id = creds
-        text = _format_message(
-            session_id=session_id,
-            platform=str(kwargs.get("platform") or ""),
-            primary=primary,
-            current=current,
-            finish_reason=str(kwargs.get("finish_reason") or ""),
-            cold_start=cold_start,
-        )
+        platform = str(kwargs.get("platform") or "")
+        if high_tier:
+            text = _format_high_tier(
+                session_id=session_id,
+                platform=platform,
+                job_name=job_name,
+                primary=primary,
+                current=current,
+                finish_reason=str(kwargs.get("finish_reason") or ""),
+                cold_start=cold_start,
+            )
+        else:
+            text = _format_low_tier(
+                session_id=session_id,
+                platform=platform,
+                job_name=job_name,
+                primary=primary,
+                current=current,
+                cold_start=cold_start,
+            )
         _send_telegram(token, chat_id, text)
     except Exception as exc:
         logger.warning("fallback-alert: hook handler failed: %s", exc)
@@ -315,6 +531,9 @@ def _reset_state_for_tests() -> None:
     with _STATE_LOCK:
         _PRIMARY_BY_SESSION.clear()
         _LAST_ALERT_BY_SESSION.clear()
+        _LOWTIER_SENT.clear()
+        _CRON_CACHE["mtime"] = None
+        _CRON_CACHE["jobs"] = {}
 
 
 def _configure_for_tests(expected_primary, fallback_pairs=None, fallback_models=None) -> None:
@@ -328,4 +547,5 @@ def _configure_for_tests(expected_primary, fallback_pairs=None, fallback_models=
 def register(ctx) -> None:
     """Plugin entrypoint, called by the Hermes plugin manager on activation."""
     _load_config_expectations()
+    _load_lowtier_state()
     ctx.register_hook("post_api_request", on_post_api_request)
